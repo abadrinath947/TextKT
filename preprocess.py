@@ -41,6 +41,7 @@ def preprocess(data_dir):
 
     data = data[~data['skill_name'].isna() & (data['skill_name'] != 'Special Null Skill')]
 
+    import pdb; pdb.set_trace()
     data_train, data_val = train_test_split(data)
     print("Train-test split finished...")
 

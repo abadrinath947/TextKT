@@ -17,63 +17,64 @@ from tqdm import tqdm
 tag = sys.argv[1]
 num_epochs = 500
 batch_size = 3
-block_size = 100
+block_size = 128
 train_split = 0.9
-encoder_batch_size = 64
 
-def encode(ques_ans):
+def encode(ques_ans, encoder_batch_size = 64, train = False):
     ques, resp, ans = ques_ans[..., 0], ques_ans[..., 1], ques_ans[..., 2]
-    input_ids = tokenizer(['Question: ' + q + '\nStudent Answer: ' + a for q, a in zip(ques.ravel(), resp.ravel())], 
+    input_ids = tokenizer(['Question: ' + q + '\nStudent Answer: ' + a for q, a in zip(ques.ravel(), resp.ravel())],
                           return_tensors="pt", padding=True, truncation=True).input_ids
     labels = tokenizer(ans.ravel().tolist(), return_tensors="pt", padding=True, truncation=True).input_ids
     labels[labels == tokenizer.pad_token_id] = -100
     last_idx = (labels == -100).int().argmax(dim = -1)
     idx = 0
     all_feat = []
-    loss = 0
     while idx < input_ids.shape[0]:
-        out = encoder(input_ids = input_ids[idx:idx+encoder_batch_size].cuda(), 
+        out = encoder(input_ids = input_ids[idx:idx+encoder_batch_size].cuda(),
                       labels = labels[idx:idx+encoder_batch_size].cuda(),
                       )
         dec = out['decoder_hidden_states']
-        all_feat.append(dec[torch.arange(len(dec)), last_idx[idx:idx+encoder_batch_size]])
+        loss = out[0]
+        if train:
+            encoder_optimizer.zero_grad()
+            loss.backward()
+            encoder_optimizer.step()
+        all_feat.append(dec[torch.arange(len(dec)), last_idx[idx:idx+encoder_batch_size]].detach().cpu().numpy())
         idx += encoder_batch_size
-        loss += out[0]
-    return torch.cat(all_feat, dim = 0).view(*ques_ans.shape[:-1], -1), loss / (input_ids.shape[0] // encoder_batch_size)
+        del out
+    return np.concatenate(all_feat)
 
-def preprocess_data(data):
+def preprocess_data(data, encoder_only = False):
     ohe_data = ohe.transform(data[ohe_columns])
     ohe_column_names = [f'ohe{i}' for i in range(len(ohe_data[0]))]
     ohe_data = pd.DataFrame(ohe_data, index = data.index, columns = ohe_column_names)
     data = data.join(ohe_data)
     #data['response_time'] = data['ms_first_response'] / 10000
-    # data = pd.concat([data, pd.DataFrame(encode(data['qtxt'], data['atxt']), index = data.index)], axis = 1)
+    data = pd.concat([data, pd.DataFrame(encode(data[['qtxt', 'atxt', 'ans']].to_numpy(), train = encoder_only), index = data.index)], axis = 1)
     data['skill_idx'] = np.argmax(data[ohe_column_names].to_numpy(), axis = 1)
     # features = ['correct'] * 20 + ['response_time', 'attempt_count', 'hint_count', 'first_action', 'position'] + ohe_column_names
-    features = ['skill_idx', 'correct'] + ohe_column_names + ['qtxt', 'atxt', 'ans'] # + [i for i in range(512)] #+ ['response_time', 'attempt_count', 'hint_count', 'first_action', 'position']
+    features = ['skill_idx', 'correct'] + ohe_column_names + [i for i in range(768)] #+ ['response_time', 'attempt_count', 'hint_count', 'first_action', 'position']
     seqs = data.groupby(['user_id']).apply(lambda x: x[features].values.tolist())
     length = min(max(seqs.str.len()), block_size)
     seqs = seqs.apply(lambda s: s[:length] + (length - min(len(s), length)) * [[-1000] * len(features)])
     seqs = np.array(seqs.to_list())
     return seqs
 
-def construct_batches(raw_data, epoch = 0, val = False):
-    np.random.seed(epoch)
+def construct_batches(raw_data, val = False, encoder_only = False):
     user_ids = raw_data['user_id'].unique()
     for _ in range(len(user_ids) // batch_size):
         user_idx = raw_data['user_id'].sample(batch_size).unique() if not val else user_ids[_ * (batch_size // 2): (_ + 1) * (batch_size // 2)]
         filtered_data = raw_data[raw_data['user_id'].isin(user_idx)].sort_values(['user_id'])
-        batch = preprocess_data(filtered_data)
-        X = torch.tensor(batch[:, :-1, ..., 1:-3].astype(float), requires_grad=True, dtype=torch.float32).cuda()
-        y = torch.tensor(batch[:, 1:, ..., [0, 1]].astype(float), requires_grad=True, dtype=torch.float32).cuda()
-        ques_ans = batch[:, :-1, ..., -3:]
-        for i in range(X.shape[1] // block_size + 1):
-            if X[:, i * block_size: (i + 1) * block_size].shape[1] > 0:
-                yield [X[:, i * block_size: (i + 1) * block_size], y[:, i * block_size: (i + 1) * block_size], ques_ans[:, i * block_size: (i + 1) * block_size]]
-            """ 
-            k = np.random.randint(low = 0, high = max(X.shape[1] - block_size - 1, 1))
-            yield X[:, k: k + block_size], y[:, k: k + block_size], ques_ans[:, k: k + block_size]
+        batch = preprocess_data(filtered_data, encoder_only)
+        X = torch.tensor(batch[:, :-1, ..., 1:], requires_grad=True, dtype=torch.float32).cuda()
+        y = torch.tensor(batch[:, 1:, ..., [0, 1]], requires_grad=True, dtype=torch.float32).cuda()
+        for _ in range(X.shape[1] // block_size + 1):
             """
+            if X[:, i * block_size: (i + 1) * block_size].shape[1] > 0:
+                yield [X[:, i * block_size: (i + 1) * block_size], y[:, i * block_size: (i + 1) * block_size]]
+            """
+            k = np.random.randint(low = 0, high = max(X.shape[1] - block_size - 1, 1))
+            yield [X[:, k: k + block_size], y[:, k: k + block_size]]
 
 def train_test_split(data, skill_list = None):
     np.random.seed(42)
@@ -88,10 +89,9 @@ def train_test_split(data, skill_list = None):
 
 def evaluate(model, batches):
     ypred, ytrue = [], []
-    for X, y, ques_ans in batches:
+    for X, y in batches:
         mask = y[..., -1] != -1000
-        feat, loss_encoder = encode(ques_ans)
-        corrects = model(torch.cat([X, feat], dim = -1), skill_idx = y[..., 0].detach())[mask]
+        corrects = model.forward(X, y[..., 0])[mask]
         y = y[..., -1].unsqueeze(-1)[mask]
         ypred.append(corrects.ravel().detach().cpu().numpy())
         ytrue.append(y.ravel().detach().cpu().numpy())
@@ -120,42 +120,34 @@ if __name__ == '__main__':
     ohe.fit(data_train[ohe_columns])
     print("OHE complete...")
 
-    tokenizer = T5Tokenizer.from_pretrained("t5-small")
-    encoder = T5ForConditionalGeneration.from_pretrained("t5-small").cuda()
+    tokenizer = T5Tokenizer.from_pretrained("t5-base")
+    encoder = T5ForConditionalGeneration.from_pretrained("t5-base").cuda()
     encoder.parallelize()
 
-    config = GPTConfig(vocab_size = 1 * len(ohe.get_feature_names_out()), block_size = block_size, n_layer = 4, n_head = 16, n_embd = 256, input_size = 640, bkt = False)
+    config = GPTConfig(vocab_size = 1 * len(ohe.get_feature_names_out()), block_size = block_size, n_layer = 4, n_head = 16, n_embd = 256, input_size = 896, bkt = False)
     model = GPT(config).cuda()
-
-    model.load_state_dict(torch.load('ckpts/model-latest_attn-19-0.7768527380727099-0.7928539459943309-0.380704790353775.pth'))
-    encoder.load_state_dict(torch.load('ckpts/encoder-latest_attn-19-0.7768527380727099-0.7928539459943309-0.380704790353775.pth'))
-
-    with torch.no_grad():
-        batches_val = construct_batches(data_val, val = True)
-        model.eval()
-        ypred, ytrue = evaluate(model, batches_val)
-
     print("Total Parameters:", sum(p.numel() for p in model.parameters()))
-    optimizer = optim.AdamW(itertools.chain(model.parameters(), encoder.decoder.block[-1].parameters(), 
-                            encoder.encoder.block[-1].parameters()), lr = 1e-4)
-    def train(num_epochs):
+
+    optimizer = optim.AdamW(model.parameters(), lr = 1e-4)
+    encoder_optimizer = optim.AdamW(encoder.parameters(), lr = 1e-4)
+    def train(num_epochs, encoder_only = False):
         for epoch in range(num_epochs):
             model.train()
-            batches_train = construct_batches(data_train, epoch = epoch)
+            batches_train = construct_batches(data_train, encoder_only = encoder_only)
             pbar = tqdm(batches_train)
             losses = []
-            for X, y, ques_ans in pbar:
-                optimizer.zero_grad()
-                feat, loss_encoder = encode(ques_ans)
-                output = model(torch.cat([X, feat], dim = -1), skill_idx = y[..., 0].detach()).ravel()
-                mask = (y[..., -1] != -1000).ravel()
-                loss = F.binary_cross_entropy(output[mask], y[..., -1:].ravel()[mask]) + 0.05 * loss_encoder
-                loss.backward()
-                optimizer.step()
-                losses.append(loss.item())
-                pbar.set_description(f"Training Loss: {np.mean(losses)}")
+            for X, y in pbar:
+                if not encoder_only:
+                    output = model(X, skill_idx = y[..., 0].detach()).ravel()
+                    mask = (y[..., -1] != -1000).ravel()
+                    loss = F.binary_cross_entropy(output[mask], y[..., -1:].ravel()[mask])
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    losses.append(loss.item())
+                    pbar.set_description(f"Training Loss: {np.mean(losses)}")
 
-            if epoch % 1 == 0:
+            if not encoder_only and epoch % 1 == 0:
                 batches_val = construct_batches(data_val, val = True)
                 model.eval()
                 ypred, ytrue = evaluate(model, batches_val)
@@ -164,7 +156,7 @@ if __name__ == '__main__':
                 rmse = np.sqrt(np.mean((ytrue - ypred) ** 2))
                 print(f"Epoch {epoch}/{num_epochs} - [VALIDATION AUC: {auc}] - [VALIDATION ACC: {acc}] - [VALIDATION RMSE: {rmse}]")
                 torch.save(model.state_dict(), f"ckpts/model-{tag}-{epoch}-{auc}-{acc}-{rmse}.pth")
-                torch.save(encoder.state_dict(), f"ckpts/encoder-{tag}-{epoch}-{auc}-{acc}-{rmse}.pth")
+    train(1, encoder_only = True)
     train(100)
     """
     bkt = []

@@ -10,14 +10,14 @@ from sklearn.preprocessing import OneHotEncoder
 from sklearn.metrics import *
 from torch import nn
 import torch.optim as optim
-from transformer import *
+from RNN import *
 from preprocess import *
 from tqdm import tqdm
 
 tag = sys.argv[1]
 num_epochs = 500
 batch_size = 3
-block_size = 100
+block_size = 40
 train_split = 0.9
 encoder_batch_size = 64
 
@@ -120,24 +120,16 @@ if __name__ == '__main__':
     ohe.fit(data_train[ohe_columns])
     print("OHE complete...")
 
-    tokenizer = T5Tokenizer.from_pretrained("t5-small")
-    encoder = T5ForConditionalGeneration.from_pretrained("t5-small").cuda()
+    tokenizer = T5Tokenizer.from_pretrained("t5-base")
+    encoder = T5ForConditionalGeneration.from_pretrained("t5-base").cuda()
     encoder.parallelize()
 
-    config = GPTConfig(vocab_size = 1 * len(ohe.get_feature_names_out()), block_size = block_size, n_layer = 4, n_head = 16, n_embd = 256, input_size = 640, bkt = False)
-    model = GPT(config).cuda()
-
-    model.load_state_dict(torch.load('ckpts/model-latest_attn-19-0.7768527380727099-0.7928539459943309-0.380704790353775.pth'))
-    encoder.load_state_dict(torch.load('ckpts/encoder-latest_attn-19-0.7768527380727099-0.7928539459943309-0.380704790353775.pth'))
-
-    with torch.no_grad():
-        batches_val = construct_batches(data_val, val = True)
-        model.eval()
-        ypred, ytrue = evaluate(model, batches_val)
-
+    #config = GPTConfig(vocab_size = 1 * len(ohe.get_feature_names_out()), block_size = block_size, n_layer = 4, n_head = 16, n_embd = 256, input_size = 640, bkt = False)
+    #model = GPT(config).cuda()
+    model = DKT(num_skills = len(ohe.get_feature_names_out()), input_dim = 896, layers = 10, hidden_dim = 256).cuda()
     print("Total Parameters:", sum(p.numel() for p in model.parameters()))
     optimizer = optim.AdamW(itertools.chain(model.parameters(), encoder.decoder.block[-1].parameters(), 
-                            encoder.encoder.block[-1].parameters()), lr = 1e-4)
+                            encoder.encoder.block[-1].parameters()), lr = 4e-4)
     def train(num_epochs):
         for epoch in range(num_epochs):
             model.train()
@@ -164,7 +156,6 @@ if __name__ == '__main__':
                 rmse = np.sqrt(np.mean((ytrue - ypred) ** 2))
                 print(f"Epoch {epoch}/{num_epochs} - [VALIDATION AUC: {auc}] - [VALIDATION ACC: {acc}] - [VALIDATION RMSE: {rmse}]")
                 torch.save(model.state_dict(), f"ckpts/model-{tag}-{epoch}-{auc}-{acc}-{rmse}.pth")
-                torch.save(encoder.state_dict(), f"ckpts/encoder-{tag}-{epoch}-{auc}-{acc}-{rmse}.pth")
     train(100)
     """
     bkt = []
